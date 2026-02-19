@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+venv/
+env/
+data/
+.kaggle/
+kaggle.json
+.DS_Store
+models/

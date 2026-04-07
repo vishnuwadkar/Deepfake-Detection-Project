@@ -36,10 +36,10 @@ def test_model_build():
     trainable_params = sum(
         p.numpy().size for p in model.trainable_weights
     )
-    print(f"  Total params     : {total_params:,}")
-    print(f"  Trainable params : {trainable_params:,}")
+    print("  Total params     : {total_params:,}")
+    print("  Trainable params : {trainable_params:,}")
 
-    print("\n✅ Model build test PASSED.")
+    print("\nModel build test PASSED.")
 
 
 if __name__ == "__main__":

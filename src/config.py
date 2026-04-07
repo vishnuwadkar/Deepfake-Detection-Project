@@ -6,8 +6,8 @@ All scripts import from here; change once, applies everywhere.
 from pathlib import Path
 
 # ─── Image / Model ───────────────────────────────────────────────
-IMG_SIZE = (224, 224)          # Xception optimal input (up from 128×128)
-BATCH_SIZE = 32
+IMG_SIZE = (224, 224)          # EfficientNetV2 optimal input
+BATCH_SIZE = 16
 
 # ─── Training Phases ─────────────────────────────────────────────
 EPOCHS_HEAD = 20               # Phase 1: train head only (frozen base)
@@ -34,6 +34,6 @@ MODEL_PATH_H5 = MODELS_DIR / "deepfake_detector_cbam.h5" # legacy fallback
 HISTORY_PLOT  = MODELS_DIR / "training_history.png"
 
 # ─── Preprocessing ───────────────────────────────────────────────
-FACE_PADDING  = 0.30     # 30% padding around MTCNN face bounding box
+FACE_PADDING  = 0.30     # 30% padding around face bounding box
 FRAME_STEP    = 10       # Sample every Nth frame (≈3 fps at 30 fps)
-JPEG_QUALITY  = 95       # cv2 JPEG save quality (0-100)
+# We store crops losslessly in .png now

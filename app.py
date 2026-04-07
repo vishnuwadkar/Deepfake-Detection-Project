@@ -1,17 +1,3 @@
-"""
-app.py — Optimized Streamlit Deepfake Detection App.
-
-Key improvements over original:
-  - MTCNN face detection during inference (matches training pipeline)
-  - Correct Xception preprocess_input() normalization (was /255.0 — broken)
-  - IMG_SIZE updated to 224×224 to match trained model
-  - Batched model.predict(batch_size=32) — avoids OOM on long videos
-  - Fixed progress bar (shows actual verdict confidence)
-  - Face detection count displayed in UI
-  - Temp file cleanup in finally block (no leaks on errors)
-  - Graceful fallback if no face detected in a frame
-"""
-
 import os
 import sys
 import tempfile
@@ -21,10 +7,8 @@ import cv2
 from pathlib import Path
 
 # ── Path setup ──────────────────────────────────────────────────────────────
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 from src.config import IMG_SIZE, BATCH_SIZE, MODEL_PATH, MODEL_PATH_H5, FACE_PADDING, FRAME_STEP
 from src.model import build_model, CUSTOM_OBJECTS
-from tensorflow.keras.applications.xception import preprocess_input
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Page Config
@@ -180,9 +164,9 @@ def load_model():
 # Inference Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _crop_face(frame_bgr: np.ndarray, box: tuple) -> np.ndarray | None:
+def _crop_face(frame_bgr: np.ndarray, bbox: tuple) -> np.ndarray | None:
     """Crops a face with 30% padding, returns None if degenerate."""
-    x, y, w, h = box
+    x, y, w, h = bbox
     pad_x = int(w * FACE_PADDING)
     pad_y = int(h * FACE_PADDING)
     x1 = max(0, x - pad_x)
@@ -196,10 +180,8 @@ def _crop_face(frame_bgr: np.ndarray, box: tuple) -> np.ndarray | None:
 
 def extract_faces_from_video(video_path: str, detector, max_frames: int = 100):
     """
-    Extracts face crops from a video for inference.
-
-    Samples every FRAME_STEP frames. Uses MTCNN to crop faces with padding.
-    Falls back to full-frame crop if no face is detected (flagged with a warning).
+    Extracts face crops from a video for inference using MTCNN.
+    Samples every FRAME_STEP frames. Skips frames without detected faces.
 
     Args:
         video_path: Path to the video file.
@@ -208,8 +190,8 @@ def extract_faces_from_video(video_path: str, detector, max_frames: int = 100):
 
     Returns:
         Tuple of:
-          - np.ndarray of preprocessed face crops, shape (N, H, W, 3)
-          - int: number of frames where no face was detected (fallback used)
+          - np.ndarray of face crops, shape (N, H, W, 3) in [0, 255] range
+          - int: number of frames where no face was detected
           - int: total frames sampled
     """
     cap = cv2.VideoCapture(video_path)
@@ -219,7 +201,7 @@ def extract_faces_from_video(video_path: str, detector, max_frames: int = 100):
         return np.array([]), 0, 0
 
     faces_collected = []
-    fallback_count = 0
+    missed_faces_count = 0
     frames_sampled = 0
     current_frame = 0
 
@@ -230,37 +212,35 @@ def extract_faces_from_video(video_path: str, detector, max_frames: int = 100):
 
         if current_frame % FRAME_STEP == 0:
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            detected = detector.detect_faces(rgb_frame)
+            detected_faces = detector.detect_faces(rgb_frame)
             frames_sampled += 1
 
-            if detected:
+            if detected_faces:
                 # Use the highest-confidence face detection
-                best = max(detected, key=lambda d: d["confidence"])
+                best = max(detected_faces, key=lambda d: d["confidence"])
+                
                 cropped = _crop_face(frame, best["box"])
                 if cropped is not None:
                     cropped_rgb = cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)
-                    resized    = cv2.resize(cropped_rgb, IMG_SIZE)
+                    resized = cv2.resize(cropped_rgb, IMG_SIZE)
                     faces_collected.append(resized)
                 else:
-                    fallback_count += 1
+                    missed_faces_count += 1
             else:
-                # No face found — use full frame as fallback
-                rgb_resized = cv2.resize(rgb_frame, IMG_SIZE)
-                faces_collected.append(rgb_resized)
-                fallback_count += 1
+                # No face found — explicitly skip this frame to prevent garbage predictions
+                missed_faces_count += 1
 
         current_frame += 1
 
     cap.release()
 
     if not faces_collected:
-        return np.array([]), fallback_count, frames_sampled
+        return np.array([]), missed_faces_count, frames_sampled
 
-    # Stack and apply Xception preprocess_input (scale to [-1, 1])
-    faces_array = np.array(faces_collected, dtype=np.float32)  # [0, 255]
-    faces_preprocessed = preprocess_input(faces_array)         # [-1, 1]
+    # EfficientNetV2 expects inputs in [0, 255] and handles normalization internally.
+    faces_array = np.array(faces_collected, dtype=np.float32)
 
-    return faces_preprocessed, fallback_count, frames_sampled
+    return faces_array, missed_faces_count, frames_sampled
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -299,7 +279,7 @@ def main():
     if uploaded_file is None:
         st.markdown(
             "<br><div style='text-align:center; color:#555; font-size:1.1rem;'>"
-            "⬆️ Upload a video above to begin analysis</div>",
+            "Upload a video above to begin analysis</div>",
             unsafe_allow_html=True,
         )
         return
@@ -314,25 +294,25 @@ def main():
         col_video, col_results = st.columns([1, 1], gap="large")
 
         with col_video:
-            st.markdown("#### 🎬 Uploaded Video")
+            st.markdown("#### Uploaded Video")
             st.video(video_path)
 
         with col_results:
-            st.markdown("#### 🔬 Analysis")
+            st.markdown("####  Analysis")
             analyze_btn = st.button(
-                "🔍 Analyze Video",
+                " Analyze Video",
                 type="primary",
                 use_container_width=True,
             )
 
             if analyze_btn:
                 with st.spinner("Detecting faces and analyzing frames..."):
-                    faces, fallback_count, frames_sampled = extract_faces_from_video(
+                    faces, missed_faces_count, frames_sampled = extract_faces_from_video(
                         video_path, detector, max_frames=100
                     )
 
                 if len(faces) == 0:
-                    st.error("❌ Could not extract any frames from the video.")
+                    st.error(" Could not extract any frames from the video.!")
                 else:
                     # ── Run Inference ─────────────────────────────────────
                     predictions = model.predict(faces, batch_size=BATCH_SIZE, verbose=0)
@@ -348,12 +328,12 @@ def main():
                     # ── Verdict Banner ─────────────────────────────────────
                     if is_fake:
                         st.markdown(
-                            '<div class="verdict-fake">🚨 DEEPFAKE DETECTED</div>',
+                            '<div class="verdict-fake">DEEPFAKE DETECTED!</div>',
                             unsafe_allow_html=True,
                         )
                     else:
                         st.markdown(
-                            '<div class="verdict-real">✅ AUTHENTIC VIDEO</div>',
+                            '<div class="verdict-real">AUTHENTIC VIDEO!</div>',
                             unsafe_allow_html=True,
                         )
 
@@ -385,14 +365,13 @@ def main():
                     st.markdown(f"**Fakeness Score** (0 = Real · 1 = Fake): `{avg_score:.3f}`")
                     st.progress(float(avg_score))
 
-                    # ── Fallback Warning ───────────────────────────────────
-                    if fallback_count > 0:
-                        pct = fallback_count / max(frames_sampled, 1) * 100
+                    # ── Missed Faces Warning ───────────────────────────────────
+                    if missed_faces_count > 0:
+                        pct = missed_faces_count / max(frames_sampled, 1) * 100
                         st.markdown(
-                            f'<div class="warning-box">⚠️ No face detected in '
-                            f'{fallback_count} of {frames_sampled} sampled frames '
-                            f'({pct:.0f}%) — full frame used as fallback. '
-                            f'Results may be less accurate.</div>',
+                            f'<div class="warning-box">No face detected in '
+                            f'{missed_faces_count} of {frames_sampled} sampled frames '
+                            f'({pct:.0f}%). These frames were safely skipped.</div>',
                             unsafe_allow_html=True,
                         )
 

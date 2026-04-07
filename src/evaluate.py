@@ -3,11 +3,12 @@ evaluate.py — Comprehensive performance visualization for the Deepfake Detecto
 
 Generates a full evaluation report with:
   1. Training History       — Loss / Accuracy / AUC curves (if history exists)
-  2. Confusion Matrix       — TP, FP, TN, FN breakdown
-  3. ROC Curve              — AUC-ROC with operating point
+  2. Confusion Matrix       — TP, FP, TN, FN breakdown (Frame-Level)
+  3. ROC Curve              — AUC-ROC with operating point (Frame-Level)
   4. Precision-Recall Curve — AUC-PR (better metric for imbalanced data)
   5. Threshold Analysis     — Precision/Recall/F1 vs decision threshold
   6. Per-Class Metrics      — Printed table: Accuracy, AUC, F1, Precision, Recall
+  7. Video-Level Metrics    — Real-world video accuracy and AUC
 
 Run:
     python src/evaluate.py
@@ -35,8 +36,6 @@ from src.config import (
 from src.model import build_model, CUSTOM_OBJECTS
 
 import tensorflow as tf
-from tensorflow.keras.applications.xception import preprocess_input
-from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from sklearn.metrics import (
     confusion_matrix, roc_curve, auc,
     precision_recall_curve, average_precision_score,
@@ -58,15 +57,18 @@ def load_model():
                 model = tf.keras.models.load_model(
                     str(target), custom_objects=custom_objects, compile=False
                 )
-                print(f"  ✓ Loaded model from: {target.name}")
+                print(f"  [OK] Loaded model from: {target.name}")
                 return model
-            except Exception:
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
                 try:
                     model = build_model(trainable_base=False)
                     model.load_weights(str(target))
-                    print(f"  ✓ Loaded weights from: {target.name}")
+                    print(f"  [OK] Loaded weights from: {target.name}")
                     return model
-                except Exception:
+                except Exception as e:
+                    traceback.print_exc()
                     continue
     return None
 
@@ -76,20 +78,18 @@ def load_model():
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_validation_data():
-    datagen = ImageDataGenerator(
-        preprocessing_function=preprocess_input,
-        validation_split=0.2,
-    )
-    gen = datagen.flow_from_directory(
+    ds = tf.keras.utils.image_dataset_from_directory(
         DATA_DIR,
-        target_size=IMG_SIZE,
-        batch_size=BATCH_SIZE,
-        class_mode="binary",
+        validation_split=0.2,
         subset="validation",
-        shuffle=False,
         seed=42,
+        image_size=IMG_SIZE,
+        batch_size=BATCH_SIZE,
+        label_mode="binary",
+        shuffle=False  # Must be false to match filenames
     )
-    return gen
+    file_paths = ds.file_paths
+    return ds.prefetch(tf.data.AUTOTUNE), file_paths
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -257,29 +257,78 @@ def evaluate():
 
     # ── Validation data ───────────────────────────────────────────────────
     print("[2/4] Loading validation data...")
-    val_gen = get_validation_data()
-    if val_gen.samples == 0:
+    val_ds, file_paths = get_validation_data()
+
+    if len(file_paths) == 0:
         print("[ERROR] No processed data found in data/processed. Run preprocess.py first.")
         return
 
-    print(f"  Samples  : {val_gen.samples}")
-    print(f"  Classes  : {val_gen.class_indices}")
+    print(f"  Samples  : {len(file_paths)}")
+
+    # Extract true labels
+    y_true = np.concatenate([y.numpy() for x, y in val_ds], axis=0).flatten()
 
     # ── Run predictions ───────────────────────────────────────────────────
     print("[3/4] Running predictions on validation set...")
-    y_scores = model.predict(val_gen, verbose=1).flatten()
-    y_true   = val_gen.classes
+    y_scores = model.predict(val_ds, verbose=1).flatten()
     y_pred   = (y_scores >= 0.5).astype(int)
 
     # ── Console metrics table ─────────────────────────────────────────────
     print("\n" + "=" * 60)
-    print("  CLASSIFICATION REPORT")
+    print("  FRAME-LEVEL CLASSIFICATION REPORT")
     print("=" * 60)
     print(classification_report(
         y_true, y_pred,
         target_names=["Real", "Fake"],
         digits=4,
     ))
+
+    # ── Video-Level Aggregation ───────────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("  VIDEO-LEVEL CLASSIFICATION REPORT")
+    print("=" * 60)
+
+    from collections import defaultdict
+    video_scores_dict = defaultdict(list)
+    video_labels_dict = {}
+
+    for path, score, true_label in zip(file_paths, y_scores, y_true):
+        filename = Path(path).name
+        # Filename format: {video_name}_f{frame_idx}_face{i}.png
+        stem_parts = filename.split("_f")
+        if len(stem_parts) > 1:
+            video_id = stem_parts[0]
+        else:
+            video_id = filename
+            
+        video_scores_dict[video_id].append(score)
+        video_labels_dict[video_id] = true_label
+
+    video_y_true = []
+    video_y_score = []
+
+    for vid, scores in video_scores_dict.items():
+        # A video is fake if a significant portion of frames are fake. 
+        # Here we use the 90th percentile score of the frames to aggregate.
+        # This catches short fake manipulations.
+        vid_score = np.percentile(scores, 90)
+        video_y_true.append(video_labels_dict[vid])
+        video_y_score.append(vid_score)
+
+    video_y_true = np.array(video_y_true)
+    video_y_score = np.array(video_y_score)
+    video_y_pred = (video_y_score >= 0.5).astype(int)
+
+    vid_acc = np.mean(video_y_pred == video_y_true)
+    if len(np.unique(video_y_true)) > 1:
+        vid_auc = roc_auc_score(video_y_true, video_y_score) if 'roc_auc_score' in globals() else roc_curve(video_y_true, video_y_score)[1] # using auc
+        fpr, tpr, _ = roc_curve(video_y_true, video_y_score)
+        vid_auc = auc(fpr, tpr)
+    else:
+        vid_auc = float('nan')
+
+    print(f"Total Unique Videos Evaluated: {len(video_y_true)}")
+    print(classification_report(video_y_true, video_y_pred, target_names=["Real Video", "Fake Video"], digits=4))
 
     # ── Build figure ──────────────────────────────────────────────────────
     print("[4/4] Generating visualisation...")
@@ -330,7 +379,7 @@ def evaluate():
         ("False Neg Rate",   f"{fnr_val*100:.1f}%"),
     ]
 
-    ax6.text(0.05, 0.97, "📊  Summary Statistics",
+    ax6.text(0.05, 0.97, "[INFO] Summary Statistics",
              transform=ax6.transAxes,
              fontsize=12, fontweight="bold",
              color=PALETTE["text"], va="top")
@@ -351,11 +400,13 @@ def evaluate():
                 facecolor=PALETTE["bg"])
     plt.close()
 
-    print(f"\n✅ Report saved to: {REPORT_PATH}")
-    print(f"\n  AUC-ROC       : {roc_auc:.4f}")
-    print(f"  Avg Precision : {avg_prec:.4f}")
-    print(f"  Best F1       : {best_f1:.4f}  (threshold = {best_t:.2f})")
-    print(f"  Accuracy      : {acc*100:.2f}%")
+    print(f"\n[OK] Report saved to: {REPORT_PATH}")
+    print(f"\n  [Frame] AUC-ROC       : {roc_auc:.4f}")
+    print(f"  [Frame] Avg Precision : {avg_prec:.4f}")
+    print(f"  [Frame] Best F1       : {best_f1:.4f}  (threshold = {best_t:.2f})")
+    print(f"  [Frame] Accuracy      : {acc*100:.2f}%")
+    print(f"\n  [Video] AUC-ROC       : {vid_auc:.4f}")
+    print(f"  [Video] Accuracy      : {vid_acc*100:.2f}%")
     print("=" * 60)
 
 

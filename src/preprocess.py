@@ -4,8 +4,8 @@ preprocess.py — Optimized face extraction pipeline.
 Improvements over original:
   - 30% face padding for more context around face edges
   - Frame sampling every FRAME_STEP frames (~3 fps at 30 fps)
-  - High-quality JPEG save (JPEG_QUALITY=95) to reduce compression artifacts
-  - Lazy MTCNN initialization (avoids re-init on import)
+  - Lossless PNG storage to avoid compression artifacts
+  - MTCNN for accurate face detection
   - Perceptual hash-based near-duplicate frame skipping
   - Resize output to IMG_SIZE (224x224) to match training config
 """
@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.config import (
     REAL_RAW, FAKE_RAW,
     REAL_PROCESSED, FAKE_PROCESSED,
-    IMG_SIZE, FACE_PADDING, FRAME_STEP, JPEG_QUALITY,
+    IMG_SIZE, FACE_PADDING, FRAME_STEP,
 )
 
 # Ensure output directories exist
@@ -31,14 +31,13 @@ REAL_PROCESSED.mkdir(parents=True, exist_ok=True)
 FAKE_PROCESSED.mkdir(parents=True, exist_ok=True)
 
 
-def get_mtcnn():
-    """Lazy-loads MTCNN on first call so module import stays fast."""
+def get_detector():
+    """Lazy-loads MTCNN face detector."""
     global _detector
     if "_detector" not in globals() or _detector is None:
         from mtcnn import MTCNN
         _detector = MTCNN()
     return _detector
-
 
 _detector = None  # Module-level sentinel
 
@@ -49,19 +48,19 @@ def _frame_hash(frame: np.ndarray) -> str:
     return hashlib.md5(small.tobytes()).hexdigest()
 
 
-def _crop_face_with_padding(frame: np.ndarray, box: tuple, padding: float = FACE_PADDING):
+def _crop_face_with_padding(frame: np.ndarray, bbox: tuple, padding: float = FACE_PADDING):
     """
     Crops a face region from `frame` with proportional padding.
 
     Args:
         frame:   BGR image (H, W, 3).
-        box:     MTCNN bounding box (x, y, w, h).
+        bbox:    Bounding box (x, y, w, h) in absolute pixels.
         padding: Fractional padding around each side (default 30%).
 
     Returns:
         Cropped BGR face image, or None if the crop is degenerate.
     """
-    x, y, w, h = box
+    x, y, w, h = bbox
     pad_x = int(w * padding)
     pad_y = int(h * padding)
 
@@ -78,24 +77,23 @@ def _crop_face_with_padding(frame: np.ndarray, box: tuple, padding: float = FACE
 
 def process_frame(frame: np.ndarray, output_dir: Path, prefix: str, frame_idx: int):
     """
-    Detects faces in a frame, crops with padding, resizes, and saves.
-
-    Args:
-        frame:      BGR image from OpenCV.
-        output_dir: Directory to save cropped face images.
-        prefix:     Filename prefix (usually video stem).
-        frame_idx:  Current frame number (for unique filenames).
+    Detects faces in a frame using MTCNN, crops with padding, resizes, and saves.
     """
-    detector = get_mtcnn()
+    detector = get_detector()
     try:
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        faces = detector.detect_faces(rgb_frame)
+        detected_faces = detector.detect_faces(rgb_frame)
 
-        if not faces:
-            return  # No face detected — skip frame silently
+        if not detected_faces:
+            return  # No face detected
+            
+        faces_saved = 0
+        for i, face_data in enumerate(detected_faces):
+            if face_data['confidence'] < 0.90:
+                continue
 
-        for i, face in enumerate(faces):
-            cropped = _crop_face_with_padding(frame, face["box"])
+            bbox = face_data['box']
+            cropped = _crop_face_with_padding(frame, bbox)
             if cropped is None:
                 continue
 
@@ -104,12 +102,13 @@ def process_frame(frame: np.ndarray, output_dir: Path, prefix: str, frame_idx: i
             except cv2.error:
                 continue
 
-            filename = f"{prefix}_f{frame_idx}_face{i}.jpg"
-            cv2.imwrite(
-                str(output_dir / filename),
-                face_resized,
-                [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY],
-            )
+            filename = f"{prefix}_f{frame_idx}_face{i}.png"
+            cv2.imwrite(str(output_dir / filename), face_resized)
+            faces_saved += 1
+            
+            # We only really care about the most prominent faces
+            if faces_saved >= 2:
+                break
 
     except Exception as exc:
         print(f"  [WARN] Error processing frame {frame_idx}: {exc}")
@@ -192,14 +191,13 @@ def main():
     print(f"  IMG_SIZE     : {IMG_SIZE}")
     print(f"  FACE_PADDING : {FACE_PADDING * 100:.0f}%")
     print(f"  FRAME_STEP   : every {FRAME_STEP} frames")
-    print(f"  JPEG_QUALITY : {JPEG_QUALITY}")
     print("=" * 60)
 
     process_directory(REAL_RAW, REAL_PROCESSED, "real")
     process_directory(FAKE_RAW, FAKE_PROCESSED, "fake")
 
-    real_count = len(list(REAL_PROCESSED.glob("*.jpg")))
-    fake_count = len(list(FAKE_PROCESSED.glob("*.jpg")))
+    real_count = len(list(REAL_PROCESSED.glob("*.png")))
+    fake_count = len(list(FAKE_PROCESSED.glob("*.png")))
     print(f"\n✅ Preprocessing complete!")
     print(f"   Real faces : {real_count}")
     print(f"   Fake faces : {fake_count}")

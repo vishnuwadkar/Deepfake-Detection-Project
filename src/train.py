@@ -1,19 +1,3 @@
-"""
-train.py — Optimized 2-phase training pipeline for Deepfake Detection.
-
-Phase 1: Train custom head only (base frozen) — 20 epochs, LR=1e-4
-Phase 2: Fine-tune top 30 Xception layers — 20 epochs, LR=1e-5
-
-Key improvements over original:
-  - Correct Xception preprocess_input() normalization (not /255.0)
-  - 2-phase training with proper fine-tuning
-  - EarlyStopping, ReduceLROnPlateau, ModelCheckpoint callbacks
-  - AUC, Precision, Recall metrics
-  - Automatic class-weight balancing
-  - Training history plot saved to models/
-  - Model saved in modern .keras format
-"""
-
 import os
 import sys
 import numpy as np
@@ -21,8 +5,8 @@ import matplotlib
 matplotlib.use("Agg")  # Non-interactive backend for saving plots
 import matplotlib.pyplot as plt
 from pathlib import Path
+import tensorflow as tf
 from sklearn.utils.class_weight import compute_class_weight
-from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from tensorflow.keras.callbacks import (
     EarlyStopping, ReduceLROnPlateau, ModelCheckpoint,
 )
@@ -36,102 +20,88 @@ from src.config import (
     DATA_DIR, MODELS_DIR, MODEL_PATH, HISTORY_PLOT,
 )
 from src.model import build_model, unfreeze_top_layers
-from tensorflow.keras.applications.xception import preprocess_input
 
 # Ensure models directory exists
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Augmentation
+# Augmentation layers (GPU accelerated)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def cutout(img: np.ndarray) -> np.ndarray:
-    """
-    Cutout augmentation: randomly masks a square region with the channel mean.
-    Applied BEFORE preprocess_input, so img values are in [0, 255].
-    """
-    h, w, _ = img.shape
-    mask_size = max(16, h // 4)  # Adaptive mask: 25% of image height
-
-    cy = np.random.randint(0, h)
-    cx = np.random.randint(0, w)
-
-    y1 = np.clip(cy - mask_size // 2, 0, h)
-    y2 = np.clip(cy + mask_size // 2, 0, h)
-    x1 = np.clip(cx - mask_size // 2, 0, w)
-    x2 = np.clip(cx + mask_size // 2, 0, w)
-
-    img[y1:y2, x1:x2, :] = np.mean(img)  # Fill with image mean (neutral)
-    return img
-
-
-def combined_preprocessing(img: np.ndarray) -> np.ndarray:
-    """Applies Cutout then Xception's preprocess_input in one step."""
-    img = cutout(img)
-    img = preprocess_input(img)
-    return img
-
+data_augmentation = tf.keras.Sequential([
+    tf.keras.layers.RandomFlip("horizontal"),
+    tf.keras.layers.RandomRotation(0.2),
+    tf.keras.layers.RandomZoom(0.15),
+    tf.keras.layers.RandomTranslation(0.1, 0.1),
+    tf.keras.layers.RandomBrightness(0.2),
+])
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Data Generators
+# tf.data Pipeline
 # ─────────────────────────────────────────────────────────────────────────────
 
-def make_generators():
-    """Creates train and validation ImageDataGenerators."""
-    train_datagen = ImageDataGenerator(
-        preprocessing_function=combined_preprocessing,
-        rotation_range=20,
-        width_shift_range=0.15,
-        height_shift_range=0.15,
-        shear_range=0.1,
-        zoom_range=0.1,
-        horizontal_flip=True,
-        brightness_range=[0.8, 1.2],
-        validation_split=0.2,
-    )
-
-    # Validation: only normalization, no augmentation
-    val_datagen = ImageDataGenerator(
-        preprocessing_function=preprocess_input,
-        validation_split=0.2,
-    )
-
-    train_gen = train_datagen.flow_from_directory(
+def make_datasets():
+    """Creates train and validation tf.data.Dataset."""
+    
+    train_ds = tf.keras.utils.image_dataset_from_directory(
         DATA_DIR,
-        target_size=IMG_SIZE,
-        batch_size=BATCH_SIZE,
-        class_mode="binary",
+        validation_split=0.2,
         subset="training",
-        shuffle=True,
         seed=42,
-    )
-
-    val_gen = val_datagen.flow_from_directory(
-        DATA_DIR,
-        target_size=IMG_SIZE,
+        image_size=IMG_SIZE,
         batch_size=BATCH_SIZE,
-        class_mode="binary",
-        subset="validation",
-        shuffle=False,
-        seed=42,
+        label_mode="binary"
     )
 
-    return train_gen, val_gen
+    val_ds = tf.keras.utils.image_dataset_from_directory(
+        DATA_DIR,
+        validation_split=0.2,
+        subset="validation",
+        seed=42,
+        image_size=IMG_SIZE,
+        batch_size=BATCH_SIZE,
+        label_mode="binary"
+    )
+    
+    # Store class names before prefetching
+    class_names = train_ds.class_names
+
+    AUTOTUNE = tf.data.AUTOTUNE
+
+    # Apply augmentation to training data
+    train_ds = train_ds.map(
+        lambda x, y: (data_augmentation(x, training=True), y),
+        num_parallel_calls=AUTOTUNE
+    )
+
+    # Cache and prefetch for performance
+    train_ds = train_ds.prefetch(buffer_size=AUTOTUNE)
+    val_ds = val_ds.prefetch(buffer_size=AUTOTUNE)
+
+    return train_ds, val_ds, class_names
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Class Weights
 # ─────────────────────────────────────────────────────────────────────────────
 
-def get_class_weights(train_gen):
-    """Computes balanced class weights to handle imbalanced datasets."""
-    labels = train_gen.classes
-    classes = np.unique(labels)
-    weights = compute_class_weight("balanced", classes=classes, y=labels)
-    cw = dict(zip(classes, weights))
+def get_class_weights():
+    """Computes balanced class weights directly from directory counts."""
+    from src.config import REAL_PROCESSED, FAKE_PROCESSED
+    
+    real_count = len(list(REAL_PROCESSED.glob('*.png')))
+    fake_count = len(list(FAKE_PROCESSED.glob('*.png')))
+    total = real_count + fake_count
+    
+    # Class 0: fake, Class 1: real (Keras standard alphanumeric sorting)
+    # weights = total / (2.0 * count)
+    weight_0 = total / (2.0 * fake_count) if fake_count > 0 else 1.0
+    weight_1 = total / (2.0 * real_count) if real_count > 0 else 1.0
+    
+    cw = {0: weight_0, 1: weight_1}
     print(f"\n  Class weights: {cw}  "
-          f"(fake={cw.get(0,'?'):.3f}, real={cw.get(1,'?'):.3f})")
+          f"(fake={weight_0:.3f}, real={weight_1:.3f})")
     return cw
 
 
@@ -212,7 +182,7 @@ def plot_history(histories: list, save_path: Path):
     plt.tight_layout()
     plt.savefig(str(save_path), dpi=150, bbox_inches="tight")
     plt.close()
-    print(f"\n  📊 Training history saved to: {save_path}")
+    print(f"\n  [INFO] Training history saved to: {save_path}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -236,19 +206,12 @@ def train():
     print("=" * 60)
 
     # ── Data ─────────────────────────────────────────────────────────────
-    print("\n[1/5] Setting up data generators...")
-    train_gen, val_gen = make_generators()
+    print("\n[1/5] Setting up tf.data pipeline...")
+    train_ds, val_ds, class_names = make_datasets()
 
-    if train_gen.samples == 0:
-        print("[ERROR] No training data found in data/processed. "
-              "Run preprocess.py first.")
-        return
+    print(f"  Classes       : {class_names}")
 
-    print(f"  Train samples : {train_gen.samples}")
-    print(f"  Val samples   : {val_gen.samples}")
-    print(f"  Classes       : {train_gen.class_indices}")
-
-    class_weights = get_class_weights(train_gen)
+    class_weights = get_class_weights()
 
     # ── Build Model ───────────────────────────────────────────────────────
     print("\n[2/5] Building model (base frozen)...")
@@ -260,17 +223,15 @@ def train():
     callbacks_p1 = make_callbacks(MODEL_PATH, phase=1)
 
     history_p1 = model.fit(
-        train_gen,
-        steps_per_epoch=train_gen.samples // BATCH_SIZE,
-        validation_data=val_gen,
-        validation_steps=val_gen.samples // BATCH_SIZE,
+        train_ds,
+        validation_data=val_ds,
         epochs=EPOCHS_HEAD,
         class_weight=class_weights,
         callbacks=callbacks_p1,
         verbose=1,
     )
 
-    print("\n  ✓ Phase 1 complete.")
+    print("\n  [OK] Phase 1 complete.")
 
     # ── Phase 2: Fine-tune Top Layers ─────────────────────────────────────
     print(f"\n[4/5] Phase 2 — Fine-tuning top {FINETUNE_LAYERS} layers "
@@ -280,22 +241,20 @@ def train():
     callbacks_p2 = make_callbacks(MODEL_PATH, phase=2)
 
     history_p2 = model.fit(
-        train_gen,
-        steps_per_epoch=train_gen.samples // BATCH_SIZE,
-        validation_data=val_gen,
-        validation_steps=val_gen.samples // BATCH_SIZE,
+        train_ds,
+        validation_data=val_ds,
         epochs=EPOCHS_FINETUNE,
         class_weight=class_weights,
         callbacks=callbacks_p2,
         verbose=1,
     )
 
-    print("\n  ✓ Phase 2 complete.")
+    print("\n  [OK] Phase 2 complete.")
 
     # ── Save & Plot ────────────────────────────────────────────────────────
     print("\n[5/5] Saving model and training history...")
     model.save(str(MODEL_PATH))
-    print(f"  ✓ Model saved to: {MODEL_PATH}")
+    print(f"  [OK] Model saved to: {MODEL_PATH}")
 
     plot_history([history_p1, history_p2], HISTORY_PLOT)
 
@@ -304,7 +263,7 @@ def train():
         max(history_p1.history.get("val_auc", [0])),
         max(history_p2.history.get("val_auc", [0])),
     )
-    print(f"\n🏆 Best Val AUC   : {best_val_auc:.4f}")
+    print(f"\n[INFO] Best Val AUC   : {best_val_auc:.4f}")
     print("=" * 60)
     print("  Training complete! Run `streamlit run app.py` to test.")
     print("=" * 60)

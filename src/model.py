@@ -6,8 +6,8 @@ custom Keras Layer subclasses that save/load cleanly.
 """
 
 import tensorflow as tf
-from tensorflow.keras.applications import Xception
-from tensorflow.keras.applications.xception import preprocess_input  # noqa: F401
+from tensorflow.keras.applications import EfficientNetV2B0
+# EfficientNetV2 handles preprocessing internally, no preprocess_input needed
 from tensorflow.keras.layers import (
     Dense, GlobalAveragePooling2D, GlobalMaxPooling2D,
     Dropout, Reshape, Add, Activation, Multiply, Conv2D, Concatenate,
@@ -108,18 +108,19 @@ def cbam_block(input_tensor, ratio: int = CBAM_RATIO):
 
 def build_model(trainable_base: bool = False) -> Model:
     """
-    Builds Xception + CBAM + custom classification head.
+    Builds EfficientNetV2B0 + CBAM + custom classification head.
 
     Args:
-        trainable_base: If True the entire Xception backbone is trainable.
+        trainable_base: If True the entire backbone is trainable.
                         Keep False for Phase-1, set True for fine-tuning.
     Returns:
         Compiled Keras Model.
     """
-    base = Xception(
+    base = EfficientNetV2B0(
         weights="imagenet",
         include_top=False,
         input_shape=IMG_SIZE + (3,),
+        include_preprocessing=True # Internal preprocessing
     )
     base.trainable = trainable_base
 
@@ -127,10 +128,12 @@ def build_model(trainable_base: bool = False) -> Model:
     x = cbam_block(x)
 
     x = GlobalAveragePooling2D()(x)
-    x = Dense(512, activation="relu", kernel_initializer="he_normal")(x)
+    x = Dense(512)(x)
+    x = Activation("relu")(x)
     x = BatchNormalization()(x)
     x = Dropout(0.5)(x)
-    x = Dense(256, activation="relu", kernel_initializer="he_normal")(x)
+    x = Dense(256)(x)
+    x = Activation("relu")(x)
     x = BatchNormalization()(x)
     x = Dropout(0.3)(x)
     predictions = Dense(1, activation="sigmoid")(x)
@@ -138,7 +141,7 @@ def build_model(trainable_base: bool = False) -> Model:
     model = Model(inputs=base.input, outputs=predictions)
     model.compile(
         optimizer=Adam(learning_rate=LR_HEAD),
-        loss="binary_crossentropy",
+        loss=tf.keras.losses.BinaryFocalCrossentropy(apply_class_balancing=False),
         metrics=[
             "accuracy",
             AUC(name="auc"),
@@ -151,17 +154,17 @@ def build_model(trainable_base: bool = False) -> Model:
 
 def unfreeze_top_layers(model: Model, n_layers: int, new_lr: float) -> Model:
     """
-    Unfreezes the top `n_layers` of the Xception backbone for fine-tuning
+    Unfreezes the top `n_layers` of the backbone for fine-tuning
     and recompiles with a lower learning rate.
     """
-    base = model.layers[1]   # Xception sub-model is always index 1
+    base = model.layers[1]   # Backbone sub-model is always index 1
     base.trainable = True
     for layer in base.layers[:-n_layers]:
         layer.trainable = False
 
     model.compile(
         optimizer=Adam(learning_rate=new_lr),
-        loss="binary_crossentropy",
+        loss=tf.keras.losses.BinaryFocalCrossentropy(apply_class_balancing=False),
         metrics=[
             "accuracy",
             AUC(name="auc"),

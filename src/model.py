@@ -20,9 +20,7 @@ from tensorflow.keras.metrics import AUC, Precision, Recall
 from src.config import IMG_SIZE, CBAM_RATIO, LR_HEAD
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Serializable custom layers to replace Lambda (which cannot be saved/loaded)
-# ─────────────────────────────────────────────────────────────────────────────
 
 class ChannelAvgPool(Layer):
     """Reduces mean across the channel axis (axis=-1), keepdims=True."""

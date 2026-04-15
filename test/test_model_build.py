@@ -1,5 +1,5 @@
 """
-test_model_build.py — Quick smoke test for model architecture.
+test_model_build.py — Smoke test for model architecture.
 Verifies build_model() produces correct input/output shapes.
 Run: python test/test_model_build.py
 """
@@ -13,7 +13,7 @@ from src.model import build_model
 from src.config import IMG_SIZE
 
 def test_model_build():
-    print("Building model (trainable_base=False)...")
+    print("Building EfficientNetV2B0 + CBAM model (trainable_base=False)...")
     model = build_model(trainable_base=False)
 
     input_shape  = tuple(model.input.shape[1:])
@@ -36,10 +36,17 @@ def test_model_build():
     trainable_params = sum(
         p.numpy().size for p in model.trainable_weights
     )
-    print("  Total params     : {total_params:,}")
-    print("  Trainable params : {trainable_params:,}")
+    print(f"  Total params     : {total_params:,}")
+    print(f"  Trainable params : {trainable_params:,}")
 
-    print("\nModel build test PASSED.")
+    # Test inference with dummy data
+    import numpy as np
+    dummy = np.random.rand(1, *IMG_SIZE, 3).astype('float32') * 255
+    pred = model.predict(dummy, verbose=0)
+    print(f"  Dummy prediction : {pred[0][0]:.4f}")
+    assert 0 <= pred[0][0] <= 1, f"Prediction out of range: {pred[0][0]}"
+
+    print("\n✓ Model build test PASSED.")
 
 
 if __name__ == "__main__":

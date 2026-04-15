@@ -1,23 +1,43 @@
+"""
+train.py -- Optimized training pipeline for DeepGuard AI.
+
+Target: 95%+ accuracy on AI-generated face detection.
+
+Key optimizations:
+  - 140K Real-and-Fake-Faces dataset (StyleGAN-generated, 256×256)
+  - Two-phase training: frozen backbone → fine-tune top 50 layers
+  - Mixup augmentation for robust generalization
+  - Label smoothing (0.1) to prevent overconfidence
+  - Cosine decay learning rate schedule
+  - Comprehensive GPU-accelerated augmentation pipeline
+  - Class weight balancing (auto-computed)
+  - Best-model checkpointing on val_auc
+
+Run:
+    python src/train.py
+"""
+
 import os
 import sys
 import numpy as np
 import matplotlib
-matplotlib.use("Agg")  # Non-interactive backend for saving plots
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from pathlib import Path
 import tensorflow as tf
-from sklearn.utils.class_weight import compute_class_weight
 from tensorflow.keras.callbacks import (
-    EarlyStopping, ReduceLROnPlateau, ModelCheckpoint,
+    EarlyStopping, ModelCheckpoint, LearningRateScheduler, TensorBoard,
 )
 
-# ── Path setup so we can import from src/ ──────────────────────────────────
+# -- Path setup --------------------------------------------------------------
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.config import (
     IMG_SIZE, BATCH_SIZE,
     EPOCHS_HEAD, EPOCHS_FINETUNE,
     LR_HEAD, LR_FINETUNE, FINETUNE_LAYERS,
-    DATA_DIR, MODELS_DIR, MODEL_PATH, HISTORY_PLOT,
+    MODELS_DIR, MODEL_PATH, HISTORY_PLOT,
+    TRAIN_DIR, VALID_DIR, DATA_DIR,
+    MIXUP_ALPHA, MAX_TRAIN_SAMPLES,
 )
 from src.model import build_model, unfreeze_top_layers
 
@@ -25,142 +45,229 @@ from src.model import build_model, unfreeze_top_layers
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Augmentation layers (GPU accelerated)
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
+# Augmentation Pipeline (GPU accelerated)
+# -----------------------------------------------------------------------------
 
 data_augmentation = tf.keras.Sequential([
     tf.keras.layers.RandomFlip("horizontal"),
-    tf.keras.layers.RandomRotation(0.2),
-    tf.keras.layers.RandomZoom(0.15),
-    tf.keras.layers.RandomTranslation(0.1, 0.1),
-    tf.keras.layers.RandomBrightness(0.2),
-])
+    tf.keras.layers.RandomRotation(0.15),
+    tf.keras.layers.RandomZoom(0.1),
+    tf.keras.layers.RandomTranslation(0.08, 0.08),
+    tf.keras.layers.RandomBrightness(0.15),
+    tf.keras.layers.RandomContrast(0.15),
+], name="augmentation")
 
-# ─────────────────────────────────────────────────────────────────────────────
+
+# -----------------------------------------------------------------------------
+# Mixup Augmentation
+# -----------------------------------------------------------------------------
+
+def mixup(images, labels, alpha=MIXUP_ALPHA):
+    """
+    Applies Mixup augmentation: blends pairs of images and labels.
+    This is one of the most effective regularization techniques for CNNs.
+    """
+    if alpha <= 0:
+        return images, labels
+
+    batch_size = tf.shape(images)[0]
+    # Sample lambda from Beta distribution
+    lam = tf.random.uniform([], 0, alpha)
+
+    # Shuffle indices
+    indices = tf.random.shuffle(tf.range(batch_size))
+    shuffled_images = tf.gather(images, indices)
+    shuffled_labels = tf.gather(labels, indices)
+
+    # Blend
+    images = lam * images + (1 - lam) * shuffled_images
+    labels = lam * labels + (1 - lam) * shuffled_labels
+
+    return images, labels
+
+
+# -----------------------------------------------------------------------------
 # tf.data Pipeline
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def make_datasets():
-    """Creates train and validation tf.data.Dataset."""
+    """
+    Creates train and validation tf.data.Datasets.
     
-    train_ds = tf.keras.utils.image_dataset_from_directory(
-        DATA_DIR,
-        validation_split=0.2,
-        subset="training",
-        seed=42,
-        image_size=IMG_SIZE,
-        batch_size=BATCH_SIZE,
-        label_mode="binary"
-    )
+    The 140K dataset has pre-built splits:
+      train/ (real + fake)  → 100K images
+      valid/ (real + fake)  → 20K images
+      test/  (real + fake)  → 20K images
+      
+    If the dataset uses the pre-split structure, we use those.
+    Otherwise, we fall back to automatic splitting from DATA_DIR.
+    """
+    # Check if pre-split directories exist
+    if TRAIN_DIR.exists() and VALID_DIR.exists():
+        print(f"  Using pre-split dataset:")
+        print(f"    Train: {TRAIN_DIR}")
+        print(f"    Valid: {VALID_DIR}")
 
-    val_ds = tf.keras.utils.image_dataset_from_directory(
-        DATA_DIR,
-        validation_split=0.2,
-        subset="validation",
-        seed=42,
-        image_size=IMG_SIZE,
-        batch_size=BATCH_SIZE,
-        label_mode="binary"
-    )
-    
-    # Store class names before prefetching
+        train_ds = tf.keras.utils.image_dataset_from_directory(
+            TRAIN_DIR,
+            seed=42,
+            image_size=IMG_SIZE,
+            batch_size=BATCH_SIZE,
+            label_mode="binary",
+            shuffle=True,
+        )
+
+        val_ds = tf.keras.utils.image_dataset_from_directory(
+            VALID_DIR,
+            seed=42,
+            image_size=IMG_SIZE,
+            batch_size=BATCH_SIZE,
+            label_mode="binary",
+            shuffle=False,
+        )
+    else:
+        # Fallback: split from single directory
+        print(f"  Using auto-split from: {DATA_DIR}")
+
+        train_ds = tf.keras.utils.image_dataset_from_directory(
+            DATA_DIR,
+            validation_split=0.2,
+            subset="training",
+            seed=42,
+            image_size=IMG_SIZE,
+            batch_size=BATCH_SIZE,
+            label_mode="binary",
+        )
+
+        val_ds = tf.keras.utils.image_dataset_from_directory(
+            DATA_DIR,
+            validation_split=0.2,
+            subset="validation",
+            seed=42,
+            image_size=IMG_SIZE,
+            batch_size=BATCH_SIZE,
+            label_mode="binary",
+        )
+
     class_names = train_ds.class_names
-
     AUTOTUNE = tf.data.AUTOTUNE
 
-    # Apply augmentation to training data
-    train_ds = train_ds.map(
-        lambda x, y: (data_augmentation(x, training=True), y),
-        num_parallel_calls=AUTOTUNE
+    # Subsample training data for CPU speed
+    if MAX_TRAIN_SAMPLES is not None:
+        steps_per_epoch = MAX_TRAIN_SAMPLES // BATCH_SIZE
+        train_ds = train_ds.take(steps_per_epoch)
+        print(f"  Subsampled to {MAX_TRAIN_SAMPLES:,} images ({steps_per_epoch} steps/epoch)")
+
+    # Apply augmentation + mixup to training data
+    def augment_and_mixup(images, labels):
+        images = data_augmentation(images, training=True)
+        images, labels = mixup(images, labels)
+        return images, labels
+
+    train_ds = (
+        train_ds
+        .map(augment_and_mixup, num_parallel_calls=AUTOTUNE)
+        .prefetch(buffer_size=AUTOTUNE)
     )
 
-    # Cache and prefetch for performance
-    train_ds = train_ds.prefetch(buffer_size=AUTOTUNE)
     val_ds = val_ds.prefetch(buffer_size=AUTOTUNE)
 
     return train_ds, val_ds, class_names
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Class Weights
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
+# Class Weights (auto-computed)
+# -----------------------------------------------------------------------------
 
 def get_class_weights():
-    """Computes balanced class weights directly from directory counts."""
-    from src.config import REAL_PROCESSED, FAKE_PROCESSED
-    
-    real_count = len(list(REAL_PROCESSED.glob('*.png')))
-    fake_count = len(list(FAKE_PROCESSED.glob('*.png')))
-    total = real_count + fake_count
-    
-    # Class 0: fake, Class 1: real (Keras standard alphanumeric sorting)
-    # weights = total / (2.0 * count)
-    weight_0 = total / (2.0 * fake_count) if fake_count > 0 else 1.0
-    weight_1 = total / (2.0 * real_count) if real_count > 0 else 1.0
-    
-    cw = {0: weight_0, 1: weight_1}
-    print(f"\n  Class weights: {cw}  "
-          f"(fake={weight_0:.3f}, real={weight_1:.3f})")
-    return cw
+    """Computes balanced class weights from directory counts."""
+    # Check both possible structures
+    for base_dir in [TRAIN_DIR, DATA_DIR]:
+        if not base_dir.exists():
+            continue
+
+        counts = {}
+        for class_dir in sorted(base_dir.iterdir()):
+            if class_dir.is_dir():
+                count = len(list(class_dir.glob("*.*")))
+                counts[class_dir.name] = count
+
+        if counts:
+            total = sum(counts.values())
+            # Alphabetical order = class index
+            sorted_names = sorted(counts.keys())
+            weights = {}
+            for i, name in enumerate(sorted_names):
+                weights[i] = total / (len(counts) * counts[name]) if counts[name] > 0 else 1.0
+
+            print(f"\n  Class counts: {counts}")
+            print(f"  Class weights: {weights}")
+            return weights
+
+    print("  [WARN] Could not compute class weights, using uniform")
+    return {0: 1.0, 1: 1.0}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
+# Cosine Decay Learning Rate Schedule
+# -----------------------------------------------------------------------------
+
+def cosine_decay_schedule(epoch, lr, total_epochs, base_lr, min_lr=1e-7):
+    """Cosine annealing with warm restarts."""
+    progress = epoch / max(total_epochs, 1)
+    new_lr = min_lr + 0.5 * (base_lr - min_lr) * (1 + np.cos(np.pi * progress))
+    return float(new_lr)
+
+
+# -----------------------------------------------------------------------------
 # Callbacks
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
-def make_callbacks(model_path: Path, monitor: str = "val_auc", phase: int = 1):
-    """Returns standard callback set for a training phase."""
-    return [
+def make_callbacks(model_path: Path, phase: int = 1, total_epochs: int = 15, base_lr: float = 3e-4):
+    """Returns callback set for a training phase."""
+    callbacks = [
         EarlyStopping(
-            monitor=monitor,
-            patience=5,
+            monitor="val_auc",
+            patience=7 if phase == 2 else 5,
             mode="max",
             restore_best_weights=True,
             verbose=1,
         ),
-        ReduceLROnPlateau(
-            monitor="val_loss",
-            factor=0.5,
-            patience=3,
-            min_lr=1e-7,
-            verbose=1,
-        ),
         ModelCheckpoint(
             filepath=str(model_path),
-            monitor=monitor,
+            monitor="val_auc",
             save_best_only=True,
             mode="max",
             verbose=1,
         ),
+        LearningRateScheduler(
+            lambda epoch, lr: cosine_decay_schedule(epoch, lr, total_epochs, base_lr),
+            verbose=0,
+        ),
     ]
+    return callbacks
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # History Plotting
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def plot_history(histories: list, save_path: Path):
-    """
-    Plots and saves training curves (loss, accuracy, AUC) across all phases.
-
-    Args:
-        histories: List of Keras History objects (one per training phase).
-        save_path: Path to save the PNG plot.
-    """
-    # Merge histories across phases
+    """Plots training curves across all phases."""
     merged = {}
     for h in histories:
         for key, values in h.history.items():
             merged.setdefault(key, []).extend(values)
 
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    fig.suptitle("Deepfake Detector — Training History", fontsize=14, fontweight="bold")
+    fig, axes = plt.subplots(1, 4, figsize=(22, 5))
+    fig.suptitle("DeepGuard AI -- Training History", fontsize=14, fontweight="bold")
 
     metrics = [
         ("loss", "val_loss", "Loss", axes[0]),
         ("accuracy", "val_accuracy", "Accuracy", axes[1]),
-        ("auc", "val_auc", "AUC", axes[2]),
+        ("auc", "val_auc", "AUC-ROC", axes[2]),
+        ("precision", "val_precision", "Precision", axes[3]),
     ]
 
     for train_key, val_key, title, ax in metrics:
@@ -169,10 +276,9 @@ def plot_history(histories: list, save_path: Path):
         if val_key in merged:
             ax.plot(merged[val_key], label="Val", linewidth=2, linestyle="--")
 
-        # Draw vertical line at phase boundary
         phase1_len = len(histories[0].history.get(train_key, []))
         if phase1_len > 0 and len(histories) > 1:
-            ax.axvline(x=phase1_len - 1, color="gray", linestyle=":", label="Fine-tune starts")
+            ax.axvline(x=phase1_len - 1, color="gray", linestyle=":", label="Fine-tune start")
 
         ax.set_title(title)
         ax.set_xlabel("Epoch")
@@ -185,42 +291,52 @@ def plot_history(histories: list, save_path: Path):
     print(f"\n  [INFO] Training history saved to: {save_path}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Main Training Entry Point
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def train():
-    if not DATA_DIR.exists():
-        print(f"[ERROR] Data directory not found: {DATA_DIR}")
-        print("  Run `python src/preprocess.py` first.")
+    # Verify data exists
+    data_found = False
+    for d in [TRAIN_DIR, DATA_DIR]:
+        if d.exists() and any(d.iterdir()):
+            data_found = True
+            break
+
+    if not data_found:
+        print(f"[ERROR] No data found. Run download_data.py first.")
+        print(f"  Checked: {TRAIN_DIR}")
+        print(f"  Checked: {DATA_DIR}")
         return
 
-    print("=" * 60)
-    print("  Deepfake Detector — Training Pipeline")
-    print("=" * 60)
+    print("=" * 70)
+    print("  DeepGuard AI -- Optimized Training Pipeline")
+    print("=" * 70)
+    print(f"  Target          : 95%+ accuracy on AI-generated face detection")
     print(f"  IMG_SIZE        : {IMG_SIZE}")
     print(f"  BATCH_SIZE      : {BATCH_SIZE}")
     print(f"  Phase 1 epochs  : {EPOCHS_HEAD}  (LR={LR_HEAD})")
     print(f"  Phase 2 epochs  : {EPOCHS_FINETUNE}  (LR={LR_FINETUNE})")
-    print(f"  Unfreeze layers : top {FINETUNE_LAYERS} Xception layers")
-    print("=" * 60)
+    print(f"  Unfreeze layers : top {FINETUNE_LAYERS}")
+    print(f"  Label smoothing : {MIXUP_ALPHA}")
+    print(f"  Mixup alpha     : {MIXUP_ALPHA}")
+    print("=" * 70)
 
-    # ── Data ─────────────────────────────────────────────────────────────
+    # -- Data -------------------------------------------------------------
     print("\n[1/5] Setting up tf.data pipeline...")
     train_ds, val_ds, class_names = make_datasets()
-
-    print(f"  Classes       : {class_names}")
+    print(f"  Classes: {class_names}")
 
     class_weights = get_class_weights()
 
-    # ── Build Model ───────────────────────────────────────────────────────
-    print("\n[2/5] Building model (base frozen)...")
+    # -- Build Model -------------------------------------------------------
+    print("\n[2/5] Building EfficientNetV2B0 + CBAM model (base frozen)...")
     model = build_model(trainable_base=False)
-    model.summary(line_length=100)
+    model.summary(line_length=110, print_fn=lambda x: print(f"  {x}"))
 
-    # ── Phase 1: Train Head ───────────────────────────────────────────────
-    print(f"\n[3/5] Phase 1 — Training head ({EPOCHS_HEAD} epochs, LR={LR_HEAD})...")
-    callbacks_p1 = make_callbacks(MODEL_PATH, phase=1)
+    # -- Phase 1: Train Head -----------------------------------------------
+    print(f"\n[3/5] Phase 1 -- Training classification head ({EPOCHS_HEAD} epochs)...")
+    callbacks_p1 = make_callbacks(MODEL_PATH, phase=1, total_epochs=EPOCHS_HEAD, base_lr=LR_HEAD)
 
     history_p1 = model.fit(
         train_ds,
@@ -231,14 +347,15 @@ def train():
         verbose=1,
     )
 
-    print("\n  [OK] Phase 1 complete.")
+    best_p1_auc = max(history_p1.history.get("val_auc", [0]))
+    best_p1_acc = max(history_p1.history.get("val_accuracy", [0]))
+    print(f"\n  [OK] Phase 1 complete -- Best val_auc: {best_p1_auc:.4f}, val_acc: {best_p1_acc:.4f}")
 
-    # ── Phase 2: Fine-tune Top Layers ─────────────────────────────────────
-    print(f"\n[4/5] Phase 2 — Fine-tuning top {FINETUNE_LAYERS} layers "
-          f"({EPOCHS_FINETUNE} epochs, LR={LR_FINETUNE})...")
+    # -- Phase 2: Fine-tune Top Layers -------------------------------------
+    print(f"\n[4/5] Phase 2 -- Fine-tuning top {FINETUNE_LAYERS} layers ({EPOCHS_FINETUNE} epochs)...")
 
     model = unfreeze_top_layers(model, n_layers=FINETUNE_LAYERS, new_lr=LR_FINETUNE)
-    callbacks_p2 = make_callbacks(MODEL_PATH, phase=2)
+    callbacks_p2 = make_callbacks(MODEL_PATH, phase=2, total_epochs=EPOCHS_FINETUNE, base_lr=LR_FINETUNE)
 
     history_p2 = model.fit(
         train_ds,
@@ -249,9 +366,11 @@ def train():
         verbose=1,
     )
 
-    print("\n  [OK] Phase 2 complete.")
+    best_p2_auc = max(history_p2.history.get("val_auc", [0]))
+    best_p2_acc = max(history_p2.history.get("val_accuracy", [0]))
+    print(f"\n  [OK] Phase 2 complete -- Best val_auc: {best_p2_auc:.4f}, val_acc: {best_p2_acc:.4f}")
 
-    # ── Save & Plot ────────────────────────────────────────────────────────
+    # -- Save & Plot --------------------------------------------------------
     print("\n[5/5] Saving model and training history...")
     model.save(str(MODEL_PATH))
     print(f"  [OK] Model saved to: {MODEL_PATH}")
@@ -259,14 +378,22 @@ def train():
     plot_history([history_p1, history_p2], HISTORY_PLOT)
 
     # Final metrics summary
-    best_val_auc = max(
-        max(history_p1.history.get("val_auc", [0])),
-        max(history_p2.history.get("val_auc", [0])),
-    )
-    print(f"\n[INFO] Best Val AUC   : {best_val_auc:.4f}")
-    print("=" * 60)
-    print("  Training complete! Run `streamlit run app.py` to test.")
-    print("=" * 60)
+    best_auc = max(best_p1_auc, best_p2_auc)
+    best_acc = max(best_p1_acc, best_p2_acc)
+
+    print(f"\n{'=' * 70}")
+    print(f"  TRAINING SUMMARY")
+    print(f"{'=' * 70}")
+    print(f"  Best Val Accuracy : {best_acc*100:.2f}%")
+    print(f"  Best Val AUC-ROC  : {best_auc:.4f}")
+    print(f"  Model saved to    : {MODEL_PATH}")
+    print(f"  History plot      : {HISTORY_PLOT}")
+    print(f"{'=' * 70}")
+    print(f"  Next steps:")
+    print(f"    1. Run evaluation : python src/evaluate.py")
+    print(f"    2. Convert to TF.js : python scripts/convert_model.py")
+    print(f"    3. Load extension in Chrome")
+    print(f"{'=' * 70}")
 
 
 if __name__ == "__main__":

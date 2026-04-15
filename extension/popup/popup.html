@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=380">
+  <title>DeepGuard AI</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="app">
+
+    <!-- ─── Header ──────────────────────────────────────────────────────── -->
+    <header class="header">
+      <div class="header-brand">
+        <div class="header-icon">
+          <svg viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <defs>
+              <linearGradient id="shieldGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+                <stop offset="0%" style="stop-color:#6C63FF"/>
+                <stop offset="100%" style="stop-color:#48CAE4"/>
+              </linearGradient>
+            </defs>
+            <path d="M16 2L4 7v7c0 7.73 5.12 14.96 12 17 6.88-2.04 12-9.27 12-17V7L16 2z" 
+                  fill="url(#shieldGrad)" opacity="0.2"/>
+            <path d="M16 2L4 7v7c0 7.73 5.12 14.96 12 17 6.88-2.04 12-9.27 12-17V7L16 2z" 
+                  stroke="url(#shieldGrad)" stroke-width="1.5" fill="none"/>
+            <circle cx="16" cy="13" r="3.5" stroke="url(#shieldGrad)" stroke-width="1.5" fill="none"/>
+            <path d="M12 20c0-2.2 1.8-4 4-4s4 1.8 4 4" stroke="url(#shieldGrad)" stroke-width="1.5" 
+                  fill="none" stroke-linecap="round"/>
+          </svg>
+        </div>
+        <div>
+          <h1 class="header-title">DeepGuard AI</h1>
+          <p class="header-subtitle">AI Content Detection</p>
+        </div>
+      </div>
+      <div class="header-status" id="headerStatus">
+        <span class="status-dot status-idle"></span>
+        <span class="status-text">Ready</span>
+      </div>
+    </header>
+
+    <!-- ─── Stats Cards ─────────────────────────────────────────────────── -->
+    <section class="stats-grid" id="statsGrid">
+      <div class="stat-card">
+        <div class="stat-value" id="statScanned">0</div>
+        <div class="stat-label">Scanned</div>
+      </div>
+      <div class="stat-card stat-card-safe">
+        <div class="stat-value" id="statSafe">0</div>
+        <div class="stat-label">Authentic</div>
+      </div>
+      <div class="stat-card stat-card-danger">
+        <div class="stat-value" id="statFlagged">0</div>
+        <div class="stat-label">AI Detected</div>
+      </div>
+    </section>
+
+    <!-- ─── Progress Bar ────────────────────────────────────────────────── -->
+    <div class="progress-section" id="progressSection" style="display:none;">
+      <div class="progress-label">
+        <span>Scanning media...</span>
+        <span id="progressPercent">0%</span>
+      </div>
+      <div class="progress-bar">
+        <div class="progress-fill" id="progressFill"></div>
+      </div>
+    </div>
+
+    <!-- ─── Action Buttons ──────────────────────────────────────────────── -->
+    <section class="actions">
+      <button class="btn btn-primary" id="btnScan">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+          <path d="M1 4V1h3M12 1h3v3M15 12v3h-3M4 15H1v-3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+          <circle cx="8" cy="8" r="3" stroke="currentColor" stroke-width="1.5"/>
+        </svg>
+        Scan This Page
+      </button>
+      <button class="btn btn-secondary" id="btnClear">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+          <path d="M2 4h12M5 4V2.5A.5.5 0 0 1 5.5 2h5a.5.5 0 0 1 .5.5V4M6.5 7v4M9.5 7v4M3.5 4l.75 9a1 1 0 0 0 1 .93h5.5a1 1 0 0 0 1-.93L12.5 4" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        Clear Results
+      </button>
+    </section>
+
+    <!-- ─── Detection List ──────────────────────────────────────────────── -->
+    <section class="detections" id="detectionsSection">
+      <h3 class="section-title">Recent Detections</h3>
+      <div class="detection-list" id="detectionList">
+        <div class="empty-state">
+          <div class="empty-icon">🛡️</div>
+          <p>No media scanned yet</p>
+          <p class="empty-hint">Click "Scan This Page" to begin analysis</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ─── Settings ────────────────────────────────────────────────────── -->
+    <section class="settings">
+      <h3 class="section-title" id="settingsToggle">
+        <span>Settings</span>
+        <svg class="chevron" width="12" height="12" viewBox="0 0 12 12" fill="none">
+          <path d="M3 4.5L6 7.5L9 4.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </h3>
+      <div class="settings-panel" id="settingsPanel">
+
+        <!-- Auto-Scan Toggle -->
+        <div class="setting-row">
+          <div class="setting-info">
+            <span class="setting-name">Auto-Scan Pages</span>
+            <span class="setting-desc">Automatically scan when page loads</span>
+          </div>
+          <label class="toggle">
+            <input type="checkbox" id="settingAutoScan">
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+
+        <!-- Show Overlays Toggle -->
+        <div class="setting-row">
+          <div class="setting-info">
+            <span class="setting-name">Show Overlays</span>
+            <span class="setting-desc">Display badges on scanned images</span>
+          </div>
+          <label class="toggle">
+            <input type="checkbox" id="settingOverlays" checked>
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+
+        <!-- Scan Videos Toggle -->
+        <div class="setting-row">
+          <div class="setting-info">
+            <span class="setting-name">Scan Videos</span>
+            <span class="setting-desc">Extract and analyze video frames</span>
+          </div>
+          <label class="toggle">
+            <input type="checkbox" id="settingScanVideos" checked>
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+
+        <!-- Sensitivity Slider -->
+        <div class="setting-row setting-row-vertical">
+          <div class="setting-info">
+            <span class="setting-name">Detection Sensitivity</span>
+            <span class="setting-desc">Lower = more detections, Higher = fewer false positives</span>
+          </div>
+          <div class="slider-container">
+            <span class="slider-label">Sensitive</span>
+            <input type="range" id="settingSensitivity" min="0.1" max="0.9" step="0.05" value="0.5" class="slider">
+            <span class="slider-label">Strict</span>
+          </div>
+          <div class="slider-value" id="sensitivityValue">0.50</div>
+        </div>
+
+      </div>
+    </section>
+
+    <!-- ─── Footer ──────────────────────────────────────────────────────── -->
+    <footer class="footer">
+      <div class="footer-privacy">
+        <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+          <rect x="2" y="5.5" width="8" height="5" rx="1" stroke="currentColor" stroke-width="1"/>
+          <path d="M4 5.5V3.5a2 2 0 0 1 4 0V5.5" stroke="currentColor" stroke-width="1" stroke-linecap="round"/>
+        </svg>
+        100% local analysis — your data never leaves your device
+      </div>
+      <div class="footer-version">DeepGuard AI v1.0.0</div>
+    </footer>
+
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

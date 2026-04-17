@@ -175,14 +175,26 @@ def unfreeze_top_layers(model: Model, n_layers: int, new_lr: float) -> Model:
     Unfreezes the top `n_layers` of the backbone for fine-tuning
     and recompiles with a lower learning rate + cosine decay.
     """
-    base = model.layers[1]   # Backbone sub-model is always index 1
-    base.trainable = True
-    for layer in base.layers[:-n_layers]:
-        layer.trainable = False
+    # Find the backbone — it's the first layer that is itself a Model/Functional
+    # (not a simple layer like Rescaling, Dense, etc.)
+    base = None
+    for layer in model.layers:
+        if hasattr(layer, 'layers') and len(getattr(layer, 'layers', [])) > 10:
+            base = layer
+            break
 
-    # Count trainable params for logging
-    trainable_count = sum(1 for layer in base.layers if layer.trainable)
-    print(f"  Unfroze {trainable_count} layers (top {n_layers} requested)")
+    if base is None:
+        print("  [WARN] Could not find backbone sub-model. Unfreezing all layers.")
+        model.trainable = True
+    else:
+        print(f"  Found backbone: {base.name} ({len(base.layers)} layers)")
+        base.trainable = True
+        for layer in base.layers[:-n_layers]:
+            layer.trainable = False
+
+        # Count trainable params for logging
+        trainable_count = sum(1 for layer in base.layers if layer.trainable)
+        print(f"  Unfroze {trainable_count} layers (top {n_layers} requested)")
 
     model.compile(
         optimizer=Adam(learning_rate=new_lr),

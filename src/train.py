@@ -351,6 +351,11 @@ def train():
     best_p1_acc = max(history_p1.history.get("val_accuracy", [0]))
     print(f"\n  [OK] Phase 1 complete -- Best val_auc: {best_p1_auc:.4f}, val_acc: {best_p1_acc:.4f}")
 
+    # Save Phase 1 backup (in case Phase 2 crashes / runtime disconnects)
+    phase1_backup = MODELS_DIR / "deepfake_detector_phase1.keras"
+    model.save(str(phase1_backup))
+    print(f"  [OK] Phase 1 backup saved to: {phase1_backup}")
+
     # -- Phase 2: Fine-tune Top Layers -------------------------------------
     print(f"\n[4/5] Phase 2 -- Fine-tuning top {FINETUNE_LAYERS} layers ({EPOCHS_FINETUNE} epochs)...")
 

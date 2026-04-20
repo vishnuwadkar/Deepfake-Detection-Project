@@ -14,3 +14,4 @@ extension/model/model.json
 *.zip
 train_log.txt
 eval_log.txt
+DeepGuard_AI_Project_Documentation.md

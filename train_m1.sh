@@ -36,39 +36,37 @@ echo -e "${GREEN}[INFO] Working directory: $SCRIPT_DIR${NC}"
 # STEP 1: Check Python version
 # =============================================================================
 echo ""
-echo -e "${BOLD}[1/7] Checking Python...${NC}"
+echo -e "${BOLD}[1/7] Checking for Conda + Python 3.11...${NC}"
 
-if command -v python3.11 &>/dev/null; then
-    PYTHON=python3.11
-elif command -v python3.10 &>/dev/null; then
-    PYTHON=python3.10
-elif command -v python3 &>/dev/null; then
-    PYTHON=python3
-else
-    echo -e "${RED}[ERROR] Python 3 not found. Install via: brew install python@3.11${NC}"
+# Check if conda is available
+if ! command -v conda &>/dev/null; then
+    echo -e "${RED}[ERROR] Conda not found. Install Miniconda: https://docs.conda.io/en/latest/miniconda.html${NC}"
     exit 1
 fi
 
-PYTHON_VERSION=$($PYTHON --version 2>&1)
-echo -e "${GREEN}[OK] Using: $PYTHON_VERSION${NC}"
+echo -e "${GREEN}[OK] Conda found: $(conda --version)${NC}"
+
+# Create/reuse conda env with Python 3.11
+ENV_NAME="deepguard"
+if conda env list | grep -q "^$ENV_NAME "; then
+    echo -e "${YELLOW}  [SKIP] Conda env '$ENV_NAME' already exists${NC}"
+else
+    echo "  Creating conda env '$ENV_NAME' with Python 3.11..."
+    conda create -n $ENV_NAME python=3.11 -y --quiet
+    echo -e "${GREEN}  [OK] Conda env created${NC}"
+fi
+
+# Activate conda env
+eval "$(conda shell.bash hook)"
+conda activate $ENV_NAME
+echo -e "${GREEN}  [OK] Activated: $ENV_NAME ($(python --version))${NC}"
 
 # =============================================================================
 # STEP 2: Create virtual environment
 # =============================================================================
 echo ""
-echo -e "${BOLD}[2/7] Setting up virtual environment...${NC}"
-
-if [ ! -d "venv_mac" ]; then
-    echo "  Creating fresh venv_mac..."
-    $PYTHON -m venv venv_mac
-    echo -e "${GREEN}  [OK] Virtual environment created${NC}"
-else
-    echo -e "${YELLOW}  [SKIP] venv_mac already exists${NC}"
-fi
-
-# Activate it
-source venv_mac/bin/activate
-echo -e "${GREEN}  [OK] Virtual environment activated${NC}"
+echo -e "${BOLD}[2/7] Conda environment ready (skipping separate venv step)...${NC}"
+echo -e "${GREEN}  [OK] Using conda env: deepguard${NC}"
 
 # =============================================================================
 # STEP 3: Install dependencies (Metal-accelerated TensorFlow)

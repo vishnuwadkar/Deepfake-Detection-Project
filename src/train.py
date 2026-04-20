@@ -235,11 +235,12 @@ def make_callbacks(model_path: Path, phase: int = 1, total_epochs: int = 15, bas
             verbose=1,
         ),
         ModelCheckpoint(
-            filepath=str(model_path),
+            filepath=str(model_path).replace('.keras', '.h5'),
             monitor="val_auc",
             save_best_only=True,
             mode="max",
             verbose=1,
+            save_format='h5',
         ),
         LearningRateScheduler(
             lambda epoch, lr: cosine_decay_schedule(epoch, lr, total_epochs, base_lr),
@@ -352,7 +353,7 @@ def train():
     print(f"\n  [OK] Phase 1 complete -- Best val_auc: {best_p1_auc:.4f}, val_acc: {best_p1_acc:.4f}")
 
     # Save Phase 1 backup (in case Phase 2 crashes / runtime disconnects)
-    phase1_backup = MODELS_DIR / "deepfake_detector_phase1.keras"
+    phase1_backup = MODELS_DIR / "deepfake_detector_phase1.h5"
     model.save(str(phase1_backup))
     print(f"  [OK] Phase 1 backup saved to: {phase1_backup}")
 
@@ -377,8 +378,9 @@ def train():
 
     # -- Save & Plot --------------------------------------------------------
     print("\n[5/5] Saving model and training history...")
-    model.save(str(MODEL_PATH))
-    print(f"  [OK] Model saved to: {MODEL_PATH}")
+    save_path = str(MODEL_PATH).replace('.keras', '.h5')
+    model.save(save_path)
+    print(f"  [OK] Model saved to: {save_path}")
 
     plot_history([history_p1, history_p2], HISTORY_PLOT)
 

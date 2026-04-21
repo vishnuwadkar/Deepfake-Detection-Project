@@ -48,7 +48,9 @@ REPORT_PATH = MODELS_DIR / "evaluation_report.png"
 
 def load_model():
     custom_objects = {**CUSTOM_OBJECTS, "tf": tf}
-    for target in (MODEL_PATH, MODEL_PATH_H5):
+    # Check all possible model file locations
+    candidates = [MODEL_PATH, MODELS_DIR / "deepfake_detector.h5", MODEL_PATH_H5]
+    for target in candidates:
         if target.exists():
             try:
                 model = tf.keras.models.load_model(

@@ -38,23 +38,39 @@ def convert():
     # -- Step 1: Load Model ------------------------------------------------
     print("\n[1/4] Loading trained model...")
     
+    from src.config import MODELS_DIR
+    from src.model import build_model as _build_model
+
     custom_objects = {**CUSTOM_OBJECTS, "tf": tf}
     model = None
 
-    for target in (MODEL_PATH, MODEL_PATH_H5):
-        if target.exists():
-            try:
-                model = tf.keras.models.load_model(
-                    str(target), custom_objects=custom_objects, compile=False
-                )
-                print(f"  [OK] Loaded model from: {target.name}")
-                print(f"  Input shape : {model.input_shape}")
-                print(f"  Output shape: {model.output_shape}")
-                print(f"  Parameters  : {model.count_params():,}")
-                break
-            except Exception as e:
-                print(f"  [WARN] Failed to load {target.name}: {e}")
-                continue
+    candidates = [MODEL_PATH, MODELS_DIR / "deepfake_detector.h5", MODEL_PATH_H5]
+    
+    for target in candidates:
+        if not target.exists():
+            continue
+        
+        # Attempt 1: Full model load
+        try:
+            model = tf.keras.models.load_model(
+                str(target), custom_objects=custom_objects, compile=False
+            )
+            print(f"  [OK] Loaded full model from: {target.name}")
+            break
+        except Exception as e1:
+            print(f"  [INFO] Full load failed for {target.name}, trying weights-only...")
+        
+        # Attempt 2: Build architecture fresh + load weights only
+        # This handles cross-TF-version .h5 files (e.g. TF 2.13 Mac -> TF 2.16 Windows)
+        try:
+            model = _build_model(trainable_base=True)
+            model.load_weights(str(target))
+            print(f"  [OK] Loaded weights from: {target.name} (architecture rebuilt locally)")
+            break
+        except Exception as e2:
+            print(f"  [WARN] Weights load also failed for {target.name}: {e2}")
+            model = None
+            continue
 
     if model is None:
         print("[ERROR] No trained model found. Run train.py first.")

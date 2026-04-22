@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>DeepGuard AI — Sandbox Inference</title>
+</head>
+<body>
+  <!--
+    Sandboxed page for TF.js inference.
+    This page has relaxed CSP (allows eval/new Function)
+    so TF.js can initialize its WebGL backend properly.
+    Communicates with the offscreen document via postMessage.
+  -->
+  <script src="../lib/tf.min.js"></script>
+  <script src="sandbox.js"></script>
+</body>
+</html>

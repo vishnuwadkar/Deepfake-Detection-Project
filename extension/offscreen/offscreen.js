@@ -1,189 +1,157 @@
 /**
- * DeepGuard AI — Offscreen Inference Engine
+ * DeepGuard AI — Offscreen Document (Message Relay)
  * 
- * Runs inside an offscreen document (hidden from user).
- * Loads the TF.js model and performs GPU-accelerated inference
- * on image data received from the service worker.
+ * This offscreen document acts as a bridge between the background
+ * service worker and the sandboxed iframe where TF.js runs.
  * 
  * Flow:
- *   1. Service worker sends RUN_INFERENCE with imageData
- *   2. This script preprocesses the image (resize to 224×224, normalize)
- *   3. Runs model.predict()
- *   4. Returns { score, isAI, confidence }
+ *   1. Background sends RUN_INFERENCE via chrome.runtime.onMessage
+ *   2. This script forwards the request to the sandbox iframe via postMessage
+ *   3. Sandbox runs TF.js inference and sends result back via postMessage
+ *   4. This script relays the result back to background via sendResponse
  */
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
-let model = null;
-let isLoadingModel = false;
-let modelLoadPromise = null;
+const pendingRequests = new Map();  // requestId → { sendResponse, timeout }
+let requestCounter = 0;
+let sandboxReady = false;
+let sandboxIframe = null;
 
-const MODEL_PATH = chrome.runtime.getURL('model/model.json');
-const INPUT_SIZE = 224;
+// ─── Sandbox Iframe Setup ────────────────────────────────────────────────────
 
-// ─── Model Loading ───────────────────────────────────────────────────────────
+function createSandbox() {
+  sandboxIframe = document.createElement('iframe');
+  sandboxIframe.src = chrome.runtime.getURL('sandbox/sandbox.html');
+  sandboxIframe.style.display = 'none';
+  document.body.appendChild(sandboxIframe);
+  console.log('[Offscreen] Sandbox iframe created');
+}
 
-async function loadModel() {
-  if (model) return model;
-  if (modelLoadPromise) return modelLoadPromise;
+// ─── Handle messages from sandbox iframe ─────────────────────────────────────
 
-  isLoadingModel = true;
-  console.log('[DeepGuard] Loading TF.js model...');
-
-  modelLoadPromise = (async () => {
-    try {
-      // Set backend — prefer WebGL for GPU acceleration
-      await tf.setBackend('webgl');
-      await tf.ready();
-      console.log('[DeepGuard] TF.js backend:', tf.getBackend());
-
-      // Load the converted model
-      model = await tf.loadGraphModel(MODEL_PATH);
+window.addEventListener('message', (event) => {
+  const data = event.data;
+  
+  if (data.type === 'SANDBOX_READY') {
+    sandboxReady = true;
+    console.log('[Offscreen] Sandbox is ready');
+    return;
+  }
+  
+  if (data.type === 'INFERENCE_RESULT') {
+    const pending = pendingRequests.get(data.requestId);
+    if (pending) {
+      clearTimeout(pending.timeout);
+      pendingRequests.delete(data.requestId);
       
-      // Warm up with a dummy tensor to compile shaders
-      const warmup = tf.zeros([1, INPUT_SIZE, INPUT_SIZE, 3]);
-      const warmupResult = model.predict(warmup);
-      warmupResult.dispose();
-      warmup.dispose();
-
-      console.log('[DeepGuard] Model loaded and warmed up');
-      isLoadingModel = false;
-      return model;
-    } catch (err) {
-      console.error('[DeepGuard] Model load failed:', err);
-      isLoadingModel = false;
-      modelLoadPromise = null;
-      throw err;
-    }
-  })();
-
-  return modelLoadPromise;
-}
-
-// ─── Image Preprocessing ─────────────────────────────────────────────────────
-
-/**
- * Preprocesses a base64 image string into a tensor.
- * EfficientNetV2 expects inputs in [0, 255] range (internal preprocessing).
- */
-async function preprocessImage(base64Data) {
-  return new Promise((resolve, reject) => {
-    const img = new Image();
-    img.onload = () => {
-      try {
-        // Draw to offscreen canvas at model input size
-        const canvas = new OffscreenCanvas(INPUT_SIZE, INPUT_SIZE);
-        const ctx = canvas.getContext('2d');
-        ctx.drawImage(img, 0, 0, INPUT_SIZE, INPUT_SIZE);
+      if (data.success) {
+        const score = data.score;
+        const threshold = pending.threshold || 0.5;
+        const isAI = score >= threshold;
+        const confidence = isAI ? score : (1 - score);
         
-        // Get pixel data and create tensor
-        const imageData = ctx.getImageData(0, 0, INPUT_SIZE, INPUT_SIZE);
+        console.log('[Offscreen] Inference result: score=', score);
         
-        // Create tensor: [1, 224, 224, 3] float32 in [0, 255]
-        const tensor = tf.tidy(() => {
-          const raw = tf.browser.fromPixels(imageData);  // [224, 224, 3] uint8
-          const float = raw.toFloat();                     // [224, 224, 3] float32
-          return float.expandDims(0);                      // [1, 224, 224, 3]
+        pending.resolve({
+          score: Math.round(score * 10000) / 10000,
+          isAI,
+          confidence: Math.round(confidence * 100),
+          elementId: pending.elementId,
         });
-        
-        resolve(tensor);
-      } catch (err) {
-        reject(err);
+      } else {
+        console.error('[Offscreen] Inference failed:', data.error);
+        pending.resolve({
+          score: -1,
+          isAI: false,
+          confidence: 0,
+          error: data.error,
+          elementId: pending.elementId,
+        });
       }
-    };
-    img.onerror = () => reject(new Error('Failed to decode image'));
-    img.src = base64Data;
+    }
+  }
+});
+
+// ─── Wait for sandbox to be ready ────────────────────────────────────────────
+
+function waitForSandbox(timeoutMs = 15000) {
+  if (sandboxReady) return Promise.resolve();
+  
+  return new Promise((resolve, reject) => {
+    const start = Date.now();
+    const check = setInterval(() => {
+      if (sandboxReady) {
+        clearInterval(check);
+        resolve();
+      } else if (Date.now() - start > timeoutMs) {
+        clearInterval(check);
+        reject(new Error('Sandbox initialization timeout'));
+      }
+    }, 100);
   });
 }
 
-/**
- * Preprocesses raw ImageData (from canvas capture) into a tensor.
- */
-function preprocessImageData(pixelData, width, height) {
-  return tf.tidy(() => {
-    // Create tensor from raw pixel array
-    const raw = tf.tensor3d(new Uint8Array(pixelData), [height, width, 4]);  // RGBA
-    const rgb = raw.slice([0, 0, 0], [-1, -1, 3]);      // Drop alpha → [H, W, 3]
-    const resized = tf.image.resizeBilinear(rgb, [INPUT_SIZE, INPUT_SIZE]);
-    const float = resized.toFloat();
-    return float.expandDims(0);                            // [1, 224, 224, 3]
-  });
-}
-
-// ─── Inference ───────────────────────────────────────────────────────────────
-
-async function runInference(imageInput) {
-  const mdl = await loadModel();
-  
-  let inputTensor;
-  
-  if (typeof imageInput === 'string') {
-    // base64 encoded image
-    inputTensor = await preprocessImage(imageInput);
-  } else if (imageInput.pixelData) {
-    // Raw pixel data from canvas
-    inputTensor = preprocessImageData(
-      imageInput.pixelData, 
-      imageInput.width, 
-      imageInput.height
-    );
-  } else {
-    throw new Error('Invalid image input format');
-  }
-  
-  try {
-    // Run prediction
-    const prediction = mdl.predict(inputTensor);
-    const score = (await prediction.data())[0];
-    
-    prediction.dispose();
-    
-    // Get current threshold from settings
-    const result = await chrome.storage.local.get('settings');
-    const threshold = result?.settings?.sensitivity || 0.5;
-    
-    const isAI = score >= threshold;
-    const confidence = isAI ? score : (1 - score);
-    
-    return {
-      score: Math.round(score * 10000) / 10000,
-      isAI,
-      confidence: Math.round(confidence * 100),
-    };
-  } finally {
-    inputTensor.dispose();
-  }
-}
-
-// ─── Message Listener ────────────────────────────────────────────────────────
+// ─── Message Listener (from background service worker) ───────────────────────
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type !== 'RUN_INFERENCE') return;
 
-  const imageInput = message.imageData;
+  const imageData = message.imageData;
+  const elementId = message.elementId;
 
-  runInference(imageInput)
-    .then((result) => {
-      sendResponse({
-        ...result,
-        elementId: message.elementId,
+  (async () => {
+    try {
+      // Wait for sandbox to be ready
+      await waitForSandbox();
+      
+      // Get threshold from settings
+      let threshold = 0.5;
+      try {
+        const result = await chrome.storage.local.get('settings');
+        threshold = result?.settings?.sensitivity || 0.5;
+      } catch (e) { /* use default */ }
+      
+      const requestId = ++requestCounter;
+      
+      // Create a promise that resolves when sandbox responds
+      const resultPromise = new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          pendingRequests.delete(requestId);
+          reject(new Error('Inference timeout (30s)'));
+        }, 30000);
+        
+        pendingRequests.set(requestId, {
+          resolve,
+          timeout,
+          elementId,
+          threshold,
+        });
       });
-    })
-    .catch((err) => {
-      console.error('[DeepGuard] Inference error:', err);
+      
+      // Send to sandbox iframe
+      sandboxIframe.contentWindow.postMessage({
+        type: 'INFERENCE_REQUEST',
+        requestId,
+        imageData,
+      }, '*');
+      
+      const result = await resultPromise;
+      sendResponse(result);
+    } catch (err) {
+      console.error('[Offscreen] Error:', err);
       sendResponse({
         score: -1,
         isAI: false,
         confidence: 0,
         error: err.message,
-        elementId: message.elementId,
+        elementId,
       });
-    });
+    }
+  })();
 
   return true; // async response
 });
 
-// ─── Pre-load model on document ready ────────────────────────────────────────
-loadModel().catch(err => {
-  console.warn('[DeepGuard] Pre-load failed (will retry on first request):', err.message);
-});
+// ─── Initialize ──────────────────────────────────────────────────────────────
+createSandbox();

@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>DeepGuard AI - Model Test</title>
+  <style>
+    body { font-family: 'Segoe UI', sans-serif; background: #1a1a2e; color: #e0e0e0; padding: 2rem; }
+    h1 { color: #6C63FF; }
+    .result { background: #16213e; padding: 1rem; border-radius: 8px; margin: 1rem 0; font-family: monospace; white-space: pre-wrap; }
+    .error { color: #ff4444; }
+    .success { color: #00ff88; }
+    button { background: #6C63FF; color: white; border: none; padding: 0.8rem 1.5rem; border-radius: 8px; cursor: pointer; font-size: 1rem; margin: 0.5rem; }
+    button:hover { background: #5a54e6; }
+    #imageInput { margin: 1rem 0; }
+    canvas { border: 1px solid #333; margin: 0.5rem; }
+  </style>
+</head>
+<body>
+  <h1>🛡️ DeepGuard AI — TF.js Model Debug</h1>
+  <p>Open DevTools (F12) → Console tab to see detailed logs.</p>
+  
+  <div>
+    <button onclick="loadAndTest()">1. Load Model & Test with Random Input</button>
+    <button onclick="testWithImage()">2. Test with Uploaded Image</button>
+  </div>
+  
+  <div>
+    <input type="file" id="imageInput" accept="image/*" />
+  </div>
+  
+  <canvas id="testCanvas" width="224" height="224"></canvas>
+  
+  <div id="output" class="result">Click a button to start testing...</div>
+
+  <!-- Load TF.js from CDN (same version as extension) -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.17.0/dist/tf.min.js"></script>
+  
+  <script>
+    const output = document.getElementById('output');
+    const canvas = document.getElementById('testCanvas');
+    const ctx = canvas.getContext('2d');
+    let model = null;
+
+    function log(msg, isError = false) {
+      const line = `[${new Date().toISOString().slice(11,19)}] ${msg}`;
+      output.textContent += '\n' + line;
+      console.log(line);
+      output.scrollTop = output.scrollHeight;
+    }
+
+    async function loadAndTest() {
+      output.textContent = 'Starting model test...';
+      
+      try {
+        // Step 1: Check model files exist
+        log('Step 1: Checking model.json...');
+        const modelUrl = './model/model.json';
+        
+        const resp = await fetch(modelUrl);
+        if (!resp.ok) throw new Error(`model.json fetch failed: ${resp.status}`);
+        const modelJson = await resp.json();
+        log(`  Format: ${modelJson.format}`);
+        log(`  Converter: ${modelJson.convertedBy}`);
+        
+        if (modelJson.signature) {
+          const inputs = Object.entries(modelJson.signature.inputs || {});
+          const outputs = Object.entries(modelJson.signature.outputs || {});
+          log(`  Inputs: ${inputs.map(([k,v]) => `${k} (${v.dtype})`).join(', ')}`);
+          log(`  Outputs: ${outputs.map(([k,v]) => `${k} (${v.dtype})`).join(', ')}`);
+        }
+
+        // Step 2: Load model
+        log('\nStep 2: Loading TF.js model...');
+        await tf.setBackend('webgl');
+        await tf.ready();
+        log(`  TF.js backend: ${tf.getBackend()}`);
+        
+        model = await tf.loadGraphModel(modelUrl);
+        log('  Model loaded successfully!');
+        log(`  Model inputs: ${JSON.stringify(model.inputs.map(i => ({name: i.name, shape: i.shape, dtype: i.dtype})))}`);
+        log(`  Model outputs: ${JSON.stringify(model.outputs.map(o => ({name: o.name, shape: o.shape, dtype: o.dtype})))}`);
+
+        // Step 3: Test with zeros
+        log('\nStep 3: Testing with zeros tensor...');
+        const zeros = tf.zeros([1, 224, 224, 3]);
+        
+        // Try predict
+        log('  Trying model.predict(zeros)...');
+        try {
+          const pred1 = model.predict(zeros);
+          const data1 = await pred1.data();
+          log(`  predict() result: ${Array.from(data1)} (shape: ${pred1.shape})`);
+          pred1.dispose();
+        } catch (e) {
+          log(`  predict() FAILED: ${e.message}`, true);
+        }
+
+        // Try executeAsync
+        log('  Trying model.executeAsync(zeros)...');
+        try {
+          const pred2 = await model.executeAsync(zeros);
+          if (Array.isArray(pred2)) {
+            for (let i = 0; i < pred2.length; i++) {
+              const d = await pred2[i].data();
+              log(`  executeAsync() output[${i}]: ${Array.from(d)} (shape: ${pred2[i].shape})`);
+              pred2[i].dispose();
+            }
+          } else {
+            const d = await pred2.data();
+            log(`  executeAsync() result: ${Array.from(d)} (shape: ${pred2.shape})`);
+            pred2.dispose();
+          }
+        } catch (e) {
+          log(`  executeAsync() FAILED: ${e.message}`, true);
+        }
+
+        // Try executeAsync with named input
+        log('  Trying model.executeAsync({keras_tensor: zeros})...');
+        try {
+          const pred3 = await model.executeAsync({'keras_tensor': zeros});
+          if (Array.isArray(pred3)) {
+            for (let i = 0; i < pred3.length; i++) {
+              const d = await pred3[i].data();
+              log(`  Named executeAsync() output[${i}]: ${Array.from(d)} (shape: ${pred3[i].shape})`);
+              pred3[i].dispose();
+            }
+          } else {
+            const d = await pred3.data();
+            log(`  Named executeAsync() result: ${Array.from(d)} (shape: ${pred3.shape})`);
+            pred3.dispose();
+          }
+        } catch (e) {
+          log(`  Named executeAsync() FAILED: ${e.message}`, true);
+        }
+
+        zeros.dispose();
+
+        // Step 4: Test with random values [0-255]
+        log('\nStep 4: Testing with random [0-255] tensor...');
+        const random = tf.randomUniform([1, 224, 224, 3], 0, 255);
+        try {
+          const pred4 = model.predict(random);
+          const data4 = await pred4.data();
+          log(`  Random predict(): ${Array.from(data4)} (shape: ${pred4.shape})`);
+          pred4.dispose();
+        } catch (e) {
+          log(`  Random predict() FAILED: ${e.message}`, true);
+          // try executeAsync
+          const pred4b = await model.executeAsync(random);
+          if (Array.isArray(pred4b)) {
+            const d = await pred4b[0].data();
+            log(`  Random executeAsync(): ${Array.from(d)}`);
+            pred4b.forEach(t => t.dispose());
+          } else {
+            const d = await pred4b.data();
+            log(`  Random executeAsync(): ${Array.from(d)}`);
+            pred4b.dispose();
+          }
+        }
+        random.dispose();
+
+        log('\n=== TEST COMPLETE ===');
+        log('Python model gives ~0.84 for random input.');
+        log('If TF.js gives ~0.84 too, the model conversion is correct.');
+        log('If TF.js gives 0 or NaN, there is a conversion issue.');
+        
+      } catch (err) {
+        log(`\nFATAL ERROR: ${err.message}`, true);
+        log(err.stack, true);
+      }
+    }
+
+    async function testWithImage() {
+      const fileInput = document.getElementById('imageInput');
+      if (!fileInput.files.length) {
+        log('Please select an image file first!');
+        return;
+      }
+
+      if (!model) {
+        log('Model not loaded! Click button 1 first.');
+        return;
+      }
+
+      const file = fileInput.files[0];
+      log(`\nTesting with uploaded image: ${file.name}`);
+
+      const img = new Image();
+      img.onload = async () => {
+        ctx.drawImage(img, 0, 0, 224, 224);
+        const imageData = ctx.getImageData(0, 0, 224, 224);
+        
+        const tensor = tf.tidy(() => {
+          const raw = tf.browser.fromPixels(imageData);
+          return raw.toFloat().expandDims(0);
+        });
+
+        log(`  Input tensor shape: ${tensor.shape}, dtype: ${tensor.dtype}`);
+        
+        try {
+          const pred = model.predict(tensor);
+          const data = await pred.data();
+          log(`  Prediction: ${Array.from(data)}`);
+          
+          const score = data[0];
+          const isAI = score >= 0.5;
+          log(`  Score: ${score.toFixed(4)}`);
+          log(`  Verdict: ${isAI ? 'AI GENERATED' : 'AUTHENTIC'}`);
+          log(`  Confidence: ${(isAI ? score : 1-score) * 100}%`);
+          
+          pred.dispose();
+        } catch (e) {
+          log(`  predict() failed: ${e.message}`, true);
+          const pred = await model.executeAsync(tensor);
+          if (Array.isArray(pred)) {
+            const d = await pred[0].data();
+            log(`  executeAsync result: ${Array.from(d)}`);
+            pred.forEach(t => t.dispose());
+          } else {
+            const d = await pred.data();
+            log(`  executeAsync result: ${Array.from(d)}`);
+            pred.dispose();
+          }
+        }
+        tensor.dispose();
+      };
+
+      img.src = URL.createObjectURL(file);
+    }
+  </script>
+</body>
+</html>

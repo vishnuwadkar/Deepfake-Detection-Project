@@ -167,11 +167,12 @@ def make_datasets():
 
     train_ds = (
         train_ds
+        .cache()  # Cache decoded images — avoids re-reading JPEGs every epoch
         .map(augment_and_mixup, num_parallel_calls=AUTOTUNE)
         .prefetch(buffer_size=AUTOTUNE)
     )
 
-    val_ds = val_ds.prefetch(buffer_size=AUTOTUNE)
+    val_ds = val_ds.cache().prefetch(buffer_size=AUTOTUNE)
 
     return train_ds, val_ds, class_names
 
